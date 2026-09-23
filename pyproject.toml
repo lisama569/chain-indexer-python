@@ -1,10 +1,20 @@
 [project]
 name = "chain-indexer-python"
-version = "0.1.0"
+version = "0.1"
 requires-python = ">=3.14.4"
 dependencies = [
     "fastapi[standard]>=0.141.1",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+log_cli = true
+log_cli_level = "INFO"
 
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
