@@ -1,11 +1,26 @@
-"""索引器：按高度推进、重复投递去重、重组回滚与追赶。"""
+"""索引器：按高度推进、重复投递去重、重组回滚、追赶与"先预演再执行"。
+
+所有请求先由只读的 :class:`~chain_indexer.planner.Planner` 推演出
+:class:`~chain_indexer.models.Plan`：
+
+- 预演（``plan_*`` / ``dry_run_*``）：只计算计划并记录决策流水，绝不写索引数据，
+  跑完位点、区块、交易与未跑时完全一致；
+- 执行（``submit_*``，以及原有 ``ingest_block`` / ``sync_to``）：在同一把提交锁内
+  重新计算计划，再于单一 SQLite 事务中物化，全成或全不动。
+
+因为执行与预演共用同一个计划引擎，且执行时在锁内重算，预演结论与执行结果
+必然一致；并发请求也被提交锁完全串行化，结果确定、可复现。
+"""
 from __future__ import annotations
 
 import logging
+import threading
 
 from .chain import GENESIS_HASH, LocalChain
 from .errors import RejectError, RejectReason
-from .models import Block, Checkpoint
+from .journal import DecisionJournal
+from .models import Block, DecisionMode, Plan
+from .planner import Planner, Prepared
 from .store import IndexStore
 
 logger = logging.getLogger("chain_indexer")
@@ -27,129 +42,162 @@ class Indexer:
     ) -> None:
         self._store = store
         self._chain = chain
-        self._max_reorg_depth = max_reorg_depth
-        self._max_catchup_span = max_catchup_span
+        self._planner = Planner(chain, max_reorg_depth, max_catchup_span)
+        self._journal = DecisionJournal(store)
+        # 提交锁：串行化所有"计划 + 物化"，保证并发结果确定、不串数据
+        self._commit_lock = threading.RLock()
 
-    # ---- 单块投递 ----
+    @property
+    def journal(self) -> DecisionJournal:
+        return self._journal
+
+    # ================= 单块投递（兼容原有接口）=================
     def ingest_block(self, block: Block) -> str:
-        cp = self._store.get_checkpoint()
-        next_height = cp.height + 1 if cp else 0
-        tip_hash = cp.block_hash if cp else GENESIS_HASH
-
-        if block.height > next_height:
-            raise RejectError(
-                RejectReason.HEIGHT_GAP,
-                f"期望高度 {next_height}，收到 {block.height}，请使用追赶接口",
-            )
-
-        if block.height == next_height:
-            if block.parent_hash != tip_hash:
-                raise RejectError(
-                    RejectReason.ORPHAN_BLOCK,
-                    f"高度 {block.height} 的父哈希 {block.parent_hash} "
-                    f"与当前链尖 {tip_hash} 不符",
-                )
-            self._apply(block)
-            return IngestResult.APPLIED
-
-        # block.height < next_height：已确认区间
-        stored = self._store.get_block_by_height(block.height)
-        if stored is not None and stored.block_hash == block.block_hash:
-            logger.info("event=duplicate height=%d hash=%s", block.height, block.block_hash)
-            return IngestResult.DUPLICATE
-
-        # 同高度不同哈希：尝试作为分叉处理
-        depth = (cp.height if cp else -1) - block.height + 1
-        if depth > self._max_reorg_depth:
-            raise RejectError(
-                RejectReason.REORG_TOO_DEEP,
-                f"重组深度 {depth} 超过上限 {self._max_reorg_depth}",
-            )
-        parent = self._store.get_block_by_height(block.height - 1)
-        parent_hash = parent.block_hash if parent else GENESIS_HASH
-        if block.height > 0 and block.parent_hash != parent_hash:
-            raise RejectError(
-                RejectReason.CONFLICTING_BLOCK,
-                f"高度 {block.height} 哈希冲突且父哈希无法衔接，拒绝部分应用",
-            )
-        removed = self._store.rollback_from(block.height)
-        logger.info(
-            "event=rollback from_height=%d removed=%s",
-            block.height,
-            [b.block_hash for b in removed],
+        """投递单个区块，返回 applied / duplicate / reorg_applied。"""
+        prep = self._submit(
+            self._planner.plan_ingest, block, kind="ingest"
         )
-        self._apply(block)
-        return IngestResult.REORG_APPLIED
+        if prep.plan.rolled_back:
+            return IngestResult.REORG_APPLIED
+        if prep.plan.applied:
+            return IngestResult.APPLIED
+        return IngestResult.DUPLICATE
 
-    # ---- 追赶 ----
+    def plan_ingest(self, block: Block) -> Plan:
+        """只读预演一次单块投递。"""
+        return self._dry_run(self._planner.plan_ingest, block, kind="ingest")
+
+    # ================= 追赶（兼容原有接口）=================
     def sync_to(self, target_height: int) -> int:
-        cp = self._store.get_checkpoint()
-        current = cp.height if cp else -1
+        """追赶到目标高度，返回最终位点高度。"""
+        prep = self._submit(
+            self._planner.plan_sync, target_height, kind="sync"
+        )
+        return prep.plan.after.height
 
-        if target_height < current:
-            raise RejectError(
-                RejectReason.CHECKPOINT_REGRESSION,
-                f"目标高度 {target_height} 低于已确认位点 {current}",
-            )
-        # 重组检测：即使目标高度等于位点，链上内容也可能已分叉
-        if cp is not None:
-            fork_height = self._find_fork_point(cp)
-            if fork_height is not None:
-                depth = cp.height - fork_height
-                if depth > self._max_reorg_depth:
-                    raise RejectError(
-                        RejectReason.REORG_TOO_DEEP,
-                        f"重组深度 {depth} 超过上限 {self._max_reorg_depth}",
-                    )
-                removed = self._store.rollback_from(fork_height + 1)
+    def plan_sync(self, target_height: int) -> Plan:
+        """只读预演一次追赶。"""
+        return self._dry_run(
+            self._planner.plan_sync, target_height, kind="sync"
+        )
+
+    # ================= 批量 =================
+    def ingest_blocks(self, blocks: list[Block]) -> Plan:
+        """一次请求投递多个区块（可覆盖一段高度），要么全成要么全不动。"""
+        return self._submit(
+            self._planner.plan_batch_ingest, list(blocks), kind="batch_ingest"
+        ).plan
+
+    def plan_batch_ingest(self, blocks: list[Block]) -> Plan:
+        """只读预演一次批量投递。"""
+        return self._dry_run(
+            self._planner.plan_batch_ingest, list(blocks), kind="batch_ingest"
+        )
+
+    def sync_batch(self, targets: list[int]) -> Plan:
+        """一次请求覆盖多个追赶目标（取最大有效高度），原子完成。"""
+        return self._submit(
+            self._planner.plan_batch_sync, list(targets), kind="batch_sync"
+        ).plan
+
+    def plan_batch_sync(self, targets: list[int]) -> Plan:
+        """只读预演一次多目标追赶。"""
+        return self._dry_run(
+            self._planner.plan_batch_sync, list(targets), kind="batch_sync"
+        )
+
+    # ================= 预演 / 执行 内部 =================
+    def _dry_run(self, plan_fn, payload, *, kind: str) -> Plan:
+        with self._commit_lock:
+            snap = self._store.snapshot()
+            prep = plan_fn(snap, payload)
+            plan = prep.plan
+        self._journal.record(DecisionMode.DRY_RUN, plan)
+        logger.info(
+            "event=dry_run kind=%s target=%s status=%s at=%d -> %s"
+            " applied=%s duplicates=%s rolled_back=%s reason=%s",
+            kind,
+            plan.target,
+            plan.status.value,
+            plan.before.height if plan.before else -1,
+            plan.after.height if plan.after else None,
+            list(plan.applied),
+            list(plan.duplicates),
+            list(plan.rolled_back),
+            plan.reason.value if plan.reason else "-",
+        )
+        return plan
+
+    def _submit(self, plan_fn, payload, *, kind: str) -> Prepared:
+        with self._commit_lock:
+            # 锁内基于最新数据重算，避免"预演后、执行前"的状态漂移
+            snap = self._store.snapshot()
+            prep = plan_fn(snap, payload)
+            plan = prep.plan
+
+            if plan.status.value == "rejected":
+                self._journal.record(DecisionMode.EXECUTE, plan)
+                logger.warning(
+                    "event=rejected kind=%s target=%s reason=%s detail=%s"
+                    " would_rollback=%s",
+                    kind,
+                    plan.target,
+                    plan.reason.value,
+                    plan.detail,
+                    list(plan.rolled_back),
+                )
+                raise RejectError(plan.reason, plan.detail)
+
+            self._materialize(prep, kind=kind)
+            self._journal.record(DecisionMode.EXECUTE, plan)
+            return prep
+
+    def _materialize(self, prep: Prepared, *, kind: str) -> None:
+        """单一事务内完成回滚、落库、位点推进；任一步失败整体回滚。"""
+        with self._store.transaction() as tx:
+            removed: list[Block] = []
+            if prep.rollback_from is not None:
+                removed = tx.rollback_from(prep.rollback_from)
+            for block in prep.apply_blocks:
+                tx.apply_block(block)
+            if prep.plan.after is not None:
+                tx.save_checkpoint(prep.plan.after)
+
+        # 事务已成功提交，再打印事件流水（保持与历史日志格式一致）
+        if removed:
+            if kind == "sync" or kind == "batch_sync":
+                # sync 的回滚由分叉触发：fork_point = 最低回滚高度 - 1
+                fork_point = min(b.height for b in removed) - 1
+                depth = len(removed)
                 logger.info(
                     "event=rollback fork_point=%d depth=%d removed=%s",
-                    fork_height,
+                    fork_point,
                     depth,
                     [b.block_hash for b in removed],
                 )
-                current = fork_height
-
-        if target_height == current:
-            return current
-        if target_height > self._chain.tip_height:
-            raise RejectError(
-                RejectReason.HEIGHT_GAP,
-                f"目标高度 {target_height} 超出本地链尖 {self._chain.tip_height}",
+            else:
+                logger.info(
+                    "event=rollback from_height=%d removed=%s",
+                    min(b.height for b in removed),
+                    [b.block_hash for b in removed],
+                )
+        for block in prep.apply_blocks:
+            logger.info(
+                "event=applied height=%d hash=%s txs=%d",
+                block.height,
+                block.block_hash,
+                len(block.transactions),
             )
-        span = target_height - current
-        if span > self._max_catchup_span:
-            raise RejectError(
-                RejectReason.CATCHUP_TOO_LARGE,
-                f"追赶跨度 {span} 超过上限 {self._max_catchup_span}",
-            )
-
-        for height in range(current + 1, target_height + 1):
-            block = self._chain.get_block(height)
-            if block is None:
-                raise RejectError(RejectReason.HEIGHT_GAP, f"本地链缺少高度 {height}")
-            self._apply(block)
-        return target_height
-
-    def _find_fork_point(self, cp: Checkpoint) -> int | None:
-        """返回分叉点高度（双方一致的最后一个高度）；无分叉返回 None。"""
-        height = cp.height
-        while height >= 0:
-            chain_block = self._chain.get_block(height)
+        for height in prep.plan.duplicates:
             stored = self._store.get_block_by_height(height)
-            if chain_block is not None and stored is not None \
-                    and chain_block.block_hash == stored.block_hash:
-                return None if height == cp.height else height
-            height -= 1
-        return -1  # 连 0 高度都不一致：分叉点为创世之前
-
-    # ---- 内部 ----
-    def _apply(self, block: Block) -> None:
-        self._store.apply_block(block)
-        self._store.save_checkpoint(Checkpoint(block.height, block.block_hash))
+            logger.info(
+                "event=duplicate height=%d hash=%s",
+                height,
+                stored.block_hash if stored else "-",
+            )
         logger.info(
-            "event=applied height=%d hash=%s txs=%d",
-            block.height,
-            block.block_hash,
-            len(block.transactions),
+            "event=committed kind=%s target=%s at_height=%s",
+            kind,
+            prep.plan.target,
+            prep.plan.after.height if prep.plan.after else None,
         )
