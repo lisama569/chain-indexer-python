@@ -96,6 +96,11 @@ def _decision_out(d: Decision) -> dict:
                 "result": o.result,
                 "reject_reason": o.reject_reason,
                 "reject_detail": o.reject_detail,
+                # 整批被拒时，accepted/rejected 上的高度为"若执行将会发生"
+                # 的候选动作；aborted 操作三个范围均为空
+                "applied_heights": list(o.applied),
+                "duplicate_heights": list(o.duplicates),
+                "rolled_back_heights": list(o.rolled_back),
             }
             for o in d.outcomes
         ],

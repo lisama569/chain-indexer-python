@@ -25,6 +25,7 @@ from .plan import (
     MODE_EXECUTE,
     MODE_PLAN,
     OpOutcome,
+    STATUS_ABORTED,
     STATUS_ACCEPTED,
     STATUS_REJECTED,
     KIND_BATCH,
@@ -141,24 +142,40 @@ class Indexer:
         outcomes: list[OpOutcome] = []
         rejected: RejectError | None = None
         cp_after: Checkpoint | None = None
+        # 每个操作评估前记录计数位点，用于切出该操作"自身"的高度范围
+        mark = self._mark(counters)
 
         try:
             # plan 模式事务在退出时回滚 -> 对索引数据严格只读
             with self._store.transaction(commit=(mode == MODE_EXECUTE)) as s:
                 cp_state: Checkpoint | None = s._get_checkpoint_unsafe()
                 for i, (op_kind, payload) in enumerate(specs):
+                    mark = self._mark(counters)
+                    logger.info(
+                        "event=op_start index=%d kind=%s target=%s cp=%s",
+                        i, op_kind,
+                        payload if op_kind == KIND_SYNC
+                        else getattr(payload, "height", None),
+                        cp_state.height if cp_state else None,
+                    )
                     if op_kind == KIND_INGEST:
                         result = self._eval_ingest(s, payload, cp_state, counters)
                         cp_state = s._get_checkpoint_unsafe()
                         outcomes.append(
-                            OpOutcome(i, KIND_INGEST, STATUS_ACCEPTED, result=result)
+                            self._op_outcome(
+                                i, KIND_INGEST, STATUS_ACCEPTED, counters, mark,
+                                result=result,
+                            )
                         )
                     else:
                         final_cp = self._eval_sync(s, payload, cp_state, counters)
                         cp_state = final_cp
-                        result = self._sync_result_label(payload, counters)
+                        result = self._sync_result_label(payload, counters, mark)
                         outcomes.append(
-                            OpOutcome(i, KIND_SYNC, STATUS_ACCEPTED, result=result)
+                            self._op_outcome(
+                                i, KIND_SYNC, STATUS_ACCEPTED, counters, mark,
+                                result=result,
+                            )
                         )
                 cp_after = s._get_checkpoint_unsafe()
                 decision = Decision(
@@ -181,20 +198,29 @@ class Indexer:
                     )
         except RejectError as exc:
             rejected = exc
-            # 事务已随异常整体回滚：被拒绝的请求没有任何最终生效动作，
-            # 故顶层 applied/duplicates/rolled_back 置空；评估期的候选结果
-            # 仍保留在 outcomes（accepted 为候选、rejected 为拒绝点、其余 aborted）。
+            # 事务已随异常整体回滚：被拒绝的请求没有任何最终生效动作。
+            # 但评估期模拟出的候选动作（典型：sync 先回滚一段已确认链，随后
+            # 才发现目标高度超出链尖）必须保留在计划里，不能因为最终被拒就
+            # 把回滚范围整个吞掉。cp_after 恒等于 cp_before：事实上位点未变。
+            rejected_index = len(outcomes)
+            outcomes.append(
+                self._op_outcome(
+                    rejected_index, specs[rejected_index][0], STATUS_REJECTED,
+                    counters, mark,
+                    reject_reason=exc.reason.value, reject_detail=exc.detail,
+                )
+            )
             decision = Decision(
                 mode=mode,
                 kind=kind,
                 status=STATUS_REJECTED,
                 request_json=request_json,
                 cp_before=cp_before,
-                applied=(),
-                duplicates=(),
-                rolled_back=(),
+                applied=tuple(counters.applied),
+                duplicates=tuple(counters.duplicates),
+                rolled_back=tuple(counters.rolled_back),
                 cp_after=cp_before,  # 实际位点未变：与请求前一致
-                outcomes=tuple(self._reject_outcomes(specs, outcomes, exc)),
+                outcomes=tuple(self._reject_outcomes(specs, outcomes)),
                 reject_reason=exc.reason,
                 reject_detail=exc.detail,
             )
@@ -322,12 +348,18 @@ class Indexer:
             self._apply(s, block, counters)
         return s._get_checkpoint_unsafe()
 
-    def _sync_result_label(self, target: int, counters: _Counters) -> str:
-        if target in counters.applied:
-            if counters.rolled_back:
+    def _sync_result_label(
+        self, target: int, counters: _Counters, mark: tuple[int, int, int]
+    ) -> str:
+        """只看本操作自身的高度范围打结果标签，不受批内前序操作影响。"""
+        op_applied = counters.applied[mark[0]:]
+        op_rolled = counters.rolled_back[mark[2]:]
+        if target in op_applied:
+            if op_rolled:
                 return IngestResult.REORG_APPLIED
             return IngestResult.APPLIED
-        if counters.rolled_back:
+        if op_rolled:
+            # 回滚后恰好停在目标高度（重组到目标），仍属于重组路径
             return IngestResult.REORG_APPLIED
         return IngestResult.NOOP
 
@@ -365,17 +397,19 @@ class Indexer:
                     b.parent_hash,
                 )
             )
-        counters.rolled_back.extend(b.height for b in removed)
+        removed_heights = [b.height for b in removed]
+        counters.rolled_back.extend(removed_heights)
         if fork_point is not None:
-            # 保持既有日志格式不变
+            # 保持既有日志格式不变（前缀文本），追加高度范围便于定位
             logger.info(
-                "event=rollback fork_point=%d depth=%d removed=%s",
-                fork_point, depth, [b.block_hash for b in removed],
+                "event=rollback fork_point=%d depth=%d heights=%s removed=%s",
+                fork_point, depth, removed_heights,
+                [b.block_hash for b in removed],
             )
         else:
             logger.info(
-                "event=rollback trigger=%s from_height=%d removed=%s",
-                trigger, height, [b.block_hash for b in removed],
+                "event=rollback trigger=%s from_height=%d heights=%s removed=%s",
+                trigger, height, removed_heights, [b.block_hash for b in removed],
             )
 
     def _reject(self, reason: RejectReason, detail: str) -> None:
@@ -417,28 +451,50 @@ class Indexer:
                 payload.append({"op": KIND_SYNC, "target_height": op.target_height})
         return json.dumps(payload, ensure_ascii=False)
 
+    def _mark(self, counters: _Counters) -> tuple[int, int, int]:
+        """记录当前各高度列表长度，供切分单个操作的范围。"""
+        return (
+            len(counters.applied),
+            len(counters.duplicates),
+            len(counters.rolled_back),
+        )
+
+    def _op_outcome(
+        self,
+        index: int,
+        op_kind: str,
+        status: str,
+        counters: _Counters,
+        mark: tuple[int, int, int],
+        result: str | None = None,
+        reject_reason: str | None = None,
+        reject_detail: str | None = None,
+    ) -> OpOutcome:
+        """从全局 counters 切出该操作自身涉及的高度范围（候选或实际）。"""
+        return OpOutcome(
+            index=index,
+            kind=op_kind,
+            status=status,
+            result=result,
+            reject_reason=reject_reason,
+            reject_detail=reject_detail,
+            applied=tuple(counters.applied[mark[0]:]),
+            duplicates=tuple(counters.duplicates[mark[1]:]),
+            rolled_back=tuple(counters.rolled_back[mark[2]:]),
+        )
+
     def _reject_outcomes(
         self,
         specs: list[tuple[str, object]],
         evaluated: list[OpOutcome],
-        exc: RejectError,
     ) -> list[OpOutcome]:
-        """规范化拒绝时的逐操作结论：评估过的保留，拒绝点单列，其后全部 aborted。"""
-        outcomes: list[OpOutcome] = []
-        rejected_index = len(evaluated)
-        for i in range(len(specs)):
-            if i < rejected_index:
-                outcomes.append(
-                    OpOutcome(i, specs[i][0], STATUS_ACCEPTED,
-                              result=evaluated[i].result)
-                )
-            elif i == rejected_index:
-                outcomes.append(
-                    OpOutcome(
-                        i, specs[i][0], STATUS_REJECTED,
-                        reject_reason=exc.reason.value, reject_detail=exc.detail,
-                    )
-                )
-            else:
-                outcomes.append(OpOutcome(i, specs[i][0], "aborted"))
+        """规范化拒绝时的逐操作结论：
+
+        已评估的（accepted 候选 + 拒绝点 rejected，均带各自的候选高度范围）
+        原样保留；其后未评估的操作全部 aborted（范围为空）。
+        """
+        outcomes: list[OpOutcome] = list(evaluated)
+        rejected_index = len(evaluated) - 1
+        for i in range(rejected_index + 1, len(specs)):
+            outcomes.append(OpOutcome(i, specs[i][0], STATUS_ABORTED))
         return outcomes

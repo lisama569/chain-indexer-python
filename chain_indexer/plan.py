@@ -11,6 +11,7 @@ MODE_EXECUTE = "execute"  # 实际执行
 
 STATUS_ACCEPTED = "accepted"
 STATUS_REJECTED = "rejected"
+STATUS_ABORTED = "aborted"  # 批量中因前序操作被拒而未评估
 
 KIND_INGEST = "ingest"
 KIND_SYNC = "sync"
@@ -33,7 +34,12 @@ class SyncOp:
 
 @dataclass(frozen=True)
 class OpOutcome:
-    """批量请求中单个操作的结论。"""
+    """批量请求中单个操作的结论。
+
+    applied/duplicates/rolled_back 为该操作自身涉及的高度范围；整批最终被
+    拒绝时，accepted/rejected 操作上的这些高度只是"若执行将会发生"的候选
+    动作（实际事务已整体回滚，什么都不生效），aborted 操作一律为空。
+    """
 
     index: int
     kind: str
@@ -41,14 +47,22 @@ class OpOutcome:
     result: str | None = None
     reject_reason: str | None = None
     reject_detail: str | None = None
+    applied: tuple[int, ...] = ()
+    duplicates: tuple[int, ...] = ()
+    rolled_back: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
 class Decision:
     """一次预演或执行的完整结论，同时作为持久化决策流水的一行。
 
-    applied/duplicates/rolled_back 为高度列表；被拒绝的预演中这些列表
-    表示"若执行将会发生"的候选动作（执行侧被拒绝时实际什么都不发生）。
+    applied/duplicates/rolled_back 为高度列表，语义分两种：
+
+    - status="accepted"：实际（执行）或将会（预演）发生的动作；
+    - status="rejected"：评估期模拟出的"若真执行将会发生"的候选动作
+      （例如会先触发重组、回滚一段已确认链，随后才因目标够不到被拒）。
+      候选信息不会因最终被拒而被吞掉；实际数据事务一律整体回滚，
+      cp_after 始终等于 cp_before，表示位点与数据事实上没有任何变化。
     """
 
     mode: str

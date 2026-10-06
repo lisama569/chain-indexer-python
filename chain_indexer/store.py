@@ -254,6 +254,7 @@ class IndexStore:
         return [self._row_to_decision(r) for r in rows]
 
     def _row_to_decision(self, row: tuple) -> Decision:
+        import dataclasses
         from .errors import RejectReason
 
         (
@@ -263,6 +264,15 @@ class IndexStore:
         ) = row
         cp_before = Checkpoint(height=bh, block_hash=bhash) if bh is not None else None
         cp_after = Checkpoint(height=ah, block_hash=ahash) if ah is not None else None
+        outcome_fields = {f.name for f in dataclasses.fields(OpOutcome)}
+
+        def _to_outcome(o: dict) -> OpOutcome:
+            data = {k: v for k, v in o.items() if k in outcome_fields}
+            # 高度范围统一为 tuple（JSON 读回的是 list；旧行缺省为 ()）
+            for name in ("applied", "duplicates", "rolled_back"):
+                data[name] = tuple(data.get(name, ()))
+            return OpOutcome(**data)
+
         return Decision(
             id=did,
             created_at=created_at,
@@ -275,7 +285,7 @@ class IndexStore:
             applied=tuple(json.loads(applied)),
             duplicates=tuple(json.loads(duplicates)),
             rolled_back=tuple(json.loads(rolled_back)),
-            outcomes=tuple(OpOutcome(**o) for o in json.loads(outcomes)),
+            outcomes=tuple(_to_outcome(o) for o in json.loads(outcomes)),
             reject_reason=RejectReason(reject_reason) if reject_reason else None,
             reject_detail=reject_detail or "",
         )
