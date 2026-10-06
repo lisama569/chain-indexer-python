@@ -33,7 +33,11 @@ class SyncOp:
 
 @dataclass(frozen=True)
 class OpOutcome:
-    """批量请求中单个操作的结论。"""
+    """批量请求中单个操作的结论。
+
+    rolled_back 为该操作评估期间会触发的高度回滚（降序）；即使该操作
+    最终被拒绝，这里仍保留"若真执行会发生"的候选回滚范围。
+    """
 
     index: int
     kind: str
@@ -41,14 +45,16 @@ class OpOutcome:
     result: str | None = None
     reject_reason: str | None = None
     reject_detail: str | None = None
+    rolled_back: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
 class Decision:
     """一次预演或执行的完整结论，同时作为持久化决策流水的一行。
 
-    applied/duplicates/rolled_back 为高度列表；被拒绝的预演中这些列表
-    表示"若执行将会发生"的候选动作（执行侧被拒绝时实际什么都不发生）。
+    applied/duplicates/rolled_back 为高度列表；被拒绝的预演或执行中这些
+    列表表示"若真执行将会发生"的候选动作（被拒绝时实际什么都不发生，
+    cp_after 也保持等于 cp_before），拒绝原因由 reject_reason 分类给出。
     """
 
     mode: str

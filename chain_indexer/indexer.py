@@ -141,25 +141,28 @@ class Indexer:
         outcomes: list[OpOutcome] = []
         rejected: RejectError | None = None
         cp_after: Checkpoint | None = None
+        rb_mark = 0  # 正在评估的操作在 counters.rolled_back 中的起始位置
 
         try:
             # plan 模式事务在退出时回滚 -> 对索引数据严格只读
             with self._store.transaction(commit=(mode == MODE_EXECUTE)) as s:
                 cp_state: Checkpoint | None = s._get_checkpoint_unsafe()
                 for i, (op_kind, payload) in enumerate(specs):
+                    # 记录本操作评估前的回滚计数，用于切出逐项回滚范围
+                    rb_mark = len(counters.rolled_back)
                     if op_kind == KIND_INGEST:
                         result = self._eval_ingest(s, payload, cp_state, counters)
                         cp_state = s._get_checkpoint_unsafe()
-                        outcomes.append(
-                            OpOutcome(i, KIND_INGEST, STATUS_ACCEPTED, result=result)
-                        )
                     else:
                         final_cp = self._eval_sync(s, payload, cp_state, counters)
                         cp_state = final_cp
                         result = self._sync_result_label(payload, counters)
-                        outcomes.append(
-                            OpOutcome(i, KIND_SYNC, STATUS_ACCEPTED, result=result)
+                    outcomes.append(
+                        OpOutcome(
+                            i, op_kind, STATUS_ACCEPTED, result=result,
+                            rolled_back=tuple(counters.rolled_back[rb_mark:]),
                         )
+                    )
                 cp_after = s._get_checkpoint_unsafe()
                 decision = Decision(
                     mode=mode,
@@ -181,20 +184,27 @@ class Indexer:
                     )
         except RejectError as exc:
             rejected = exc
-            # 事务已随异常整体回滚：被拒绝的请求没有任何最终生效动作，
-            # 故顶层 applied/duplicates/rolled_back 置空；评估期的候选结果
-            # 仍保留在 outcomes（accepted 为候选、rejected 为拒绝点、其余 aborted）。
+            # 事务已随异常整体回滚：被拒绝的请求没有任何最终生效动作。
+            # 但顶层 applied/duplicates/rolled_back 与逐项 outcomes 仍保留
+            # 评估期算出的候选结果（"若真执行会发生"的动作，含拒绝点操作
+            # 在被拒前已评估出的候选回滚范围），让预演能给出完整执行计划；
+            # cp_after 仍等于 cp_before，因为实际位点没有变化。
             decision = Decision(
                 mode=mode,
                 kind=kind,
                 status=STATUS_REJECTED,
                 request_json=request_json,
                 cp_before=cp_before,
-                applied=(),
-                duplicates=(),
-                rolled_back=(),
+                applied=tuple(counters.applied),
+                duplicates=tuple(counters.duplicates),
+                rolled_back=tuple(counters.rolled_back),
                 cp_after=cp_before,  # 实际位点未变：与请求前一致
-                outcomes=tuple(self._reject_outcomes(specs, outcomes, exc)),
+                outcomes=tuple(
+                    self._reject_outcomes(
+                        specs, outcomes, exc,
+                        rejected_rolled_back=tuple(counters.rolled_back[rb_mark:]),
+                    )
+                ),
                 reject_reason=exc.reason,
                 reject_detail=exc.detail,
             )
@@ -422,21 +432,21 @@ class Indexer:
         specs: list[tuple[str, object]],
         evaluated: list[OpOutcome],
         exc: RejectError,
+        rejected_rolled_back: tuple[int, ...] = (),
     ) -> list[OpOutcome]:
-        """规范化拒绝时的逐操作结论：评估过的保留，拒绝点单列，其后全部 aborted。"""
+        """规范化拒绝时的逐操作结论：评估过的保留（含各自候选回滚范围），
+        拒绝点单列并带上它在被拒前评估出的候选回滚范围，其后全部 aborted。"""
         outcomes: list[OpOutcome] = []
         rejected_index = len(evaluated)
         for i in range(len(specs)):
             if i < rejected_index:
-                outcomes.append(
-                    OpOutcome(i, specs[i][0], STATUS_ACCEPTED,
-                              result=evaluated[i].result)
-                )
+                outcomes.append(evaluated[i])
             elif i == rejected_index:
                 outcomes.append(
                     OpOutcome(
                         i, specs[i][0], STATUS_REJECTED,
                         reject_reason=exc.reason.value, reject_detail=exc.detail,
+                        rolled_back=rejected_rolled_back,
                     )
                 )
             else:

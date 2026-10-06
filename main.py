@@ -96,6 +96,7 @@ def _decision_out(d: Decision) -> dict:
                 "result": o.result,
                 "reject_reason": o.reject_reason,
                 "reject_detail": o.reject_detail,
+                "rolled_back_heights": list(o.rolled_back),
             }
             for o in d.outcomes
         ],

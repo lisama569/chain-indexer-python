@@ -275,7 +275,10 @@ class IndexStore:
             applied=tuple(json.loads(applied)),
             duplicates=tuple(json.loads(duplicates)),
             rolled_back=tuple(json.loads(rolled_back)),
-            outcomes=tuple(OpOutcome(**o) for o in json.loads(outcomes)),
+            outcomes=tuple(
+                OpOutcome(**{**o, "rolled_back": tuple(o.get("rolled_back", ()))})
+                for o in json.loads(outcomes)
+            ),
             reject_reason=RejectReason(reject_reason) if reject_reason else None,
             reject_detail=reject_detail or "",
         )
